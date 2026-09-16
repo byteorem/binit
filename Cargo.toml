@@ -5,6 +5,7 @@ edition = "2024"
 # windows-core 0.100 needs 1.95; the code itself needs 1.88 (let-chains).
 rust-version = "1.95"
 description = "Move files to the Windows Recycle Bin, or refuse. Never deletes permanently."
+repository = "https://github.com/byteorem/binit"
 license = "MIT"
 publish = false
 
