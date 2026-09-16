@@ -1,0 +1,46 @@
+[package]
+name = "binit"
+version = "0.1.0"
+edition = "2024"
+# windows-core 0.100 needs 1.95; the code itself needs 1.88 (let-chains).
+rust-version = "1.95"
+description = "Move files to the Windows Recycle Bin, or refuse. Never deletes permanently."
+license = "MIT"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+wild = "2"
+# preserve_order so --json emits keys in the documented order
+serde_json = { version = "1", features = ["preserve_order"] }
+# COM runtime support for the generated bindings. Must be a direct dependency
+# under this exact name: `#[implement]` expands to `windows_core::` paths.
+windows-core = "0.100"
+
+[build-dependencies]
+# Generates only the Win32 items binit uses (see build.rs) instead of pulling
+# the `windows` umbrella crate, which windows-rs now recommends against and
+# which lags behind the 0.100 line.
+windows-bindgen = "0.100"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+# Every `unsafe` block carries a SAFETY comment; keep it that way.
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"
+# A panic that escapes a COM callback aborts either way (Rust >= 1.81 aborts
+# on unwind out of an `extern "system"` fn). Make that explicit and drop the
+# unwinding tables from the binary.
+panic = "abort"
