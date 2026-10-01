@@ -179,3 +179,222 @@ fn help_mentions_the_no_force_promise() {
         .code(0)
         .stdout(predicates::str::contains("There is no --force"));
 }
+
+#[test]
+fn drive_root_is_refused_even_in_dry_run() {
+    // `--dry-run` only: never point the real binary at a drive root.
+    for arg in [r"C:\", "C:", "C:/"] {
+        let out = binit()
+            .args(["--dry-run", "--json", arg])
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let doc = json(&out.stdout);
+        assert_eq!(doc["failed"][0]["code"], "DRIVE_ROOT", "{arg}");
+        assert!(doc["recycled"].as_array().unwrap().is_empty(), "{arg}");
+    }
+}
+
+#[test]
+fn trailing_separator_is_the_same_path() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("build")).unwrap();
+
+    let out = binit()
+        .current_dir(dir.path())
+        .args(["--dry-run", "--json", "build", r"build\"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json(&out.stdout);
+    assert_eq!(doc["recycled"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["skipped"][0]["reason"], "duplicate");
+    assert_eq!(doc["skipped"][0]["container"], "build");
+}
+
+#[test]
+fn glob_expands_to_every_match() {
+    let dir = TempDir::new().unwrap();
+    for name in ["a.txt", "b.txt", "c.log"] {
+        fs::write(dir.path().join(name), "").unwrap();
+    }
+
+    let out = binit()
+        .current_dir(dir.path())
+        .args(["--dry-run", "--json", "*.txt"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json(&out.stdout);
+    let names: Vec<&str> = doc["recycled"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a.txt", "b.txt"]);
+}
+
+#[test]
+fn f_reports_a_missing_path_as_skipped() {
+    let dir = TempDir::new().unwrap();
+    let out = binit()
+        .args(["-f", "--json"])
+        .arg(dir.path().join("gone.txt"))
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json(&out.stdout);
+    assert_eq!(doc["skipped"][0]["reason"], "missing");
+    assert!(doc["skipped"][0]["container"].is_null());
+    assert!(doc["failed"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn f_is_not_a_force_flag() {
+    // Refusals and other failures still fail under -f.
+    let out = binit()
+        .args(["-f", "--json", r"\\localhost\nope\file.txt", ""])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc = json(&out.stdout);
+    assert_eq!(doc["failed"][0]["code"], "UNC_NO_RECYCLE_BIN");
+    assert_eq!(doc["failed"][1]["code"], "EMPTY_PATH");
+    assert!(doc["skipped"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn recursive_long_flag_is_accepted() {
+    let dir = TempDir::new().unwrap();
+    binit()
+        .args(["--recursive", "-n"])
+        .arg(dir.path())
+        .assert()
+        .code(0);
+}
+
+#[test]
+fn force_is_refused_with_a_pointer_to_the_powershell_cmdlet() {
+    let out = binit()
+        .args(["--force", "whatever.txt"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no --force"), "{stderr}");
+    assert!(stderr.contains("Remove-Item"), "{stderr}");
+    assert!(!stderr.contains("-- --force"), "{stderr}");
+}
+
+#[test]
+fn files_from_file_appends_after_positional_paths() {
+    let dir = TempDir::new().unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(dir.path().join(name), "").unwrap();
+    }
+    // CRLF, a blank line, a whitespace-only line, and a BOM.
+    fs::write(
+        dir.path().join("list.lst"),
+        "\u{feff}b.txt\r\n\r\n   \r\nc.txt\r\n",
+    )
+    .unwrap();
+
+    let out = binit()
+        .current_dir(dir.path())
+        .args(["--dry-run", "--json", "a.txt", "--files-from", "list.lst"])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let doc = json(&out.stdout);
+    let names: Vec<&str> = doc["recycled"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a.txt", "b.txt", "c.txt"]);
+}
+
+#[test]
+fn files_from_stdin_with_dash() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.txt"), "").unwrap();
+
+    let out = binit()
+        .current_dir(dir.path())
+        .args(["--dry-run", "--json", "--files-from", "-"])
+        .write_stdin("a.txt\n")
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    assert_eq!(json(&out.stdout)["recycled"][0]["path"], "a.txt");
+}
+
+#[test]
+fn files_from_lines_are_literal_paths() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("a.txt"), "").unwrap();
+
+    let out = binit()
+        .current_dir(dir.path())
+        .args(["--dry-run", "--json", "--files-from", "-"])
+        .write_stdin("*.txt\n")
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let doc = json(&out.stdout);
+    assert_eq!(doc["failed"][0]["code"], "NOT_FOUND");
+    assert!(doc["recycled"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn unreadable_files_from_is_a_usage_error() {
+    let dir = TempDir::new().unwrap();
+    let out = binit()
+        .arg("--files-from")
+        .arg(dir.path().join("no-such-list.lst"))
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot read --files-from"), "{stderr}");
+}
+
+#[test]
+fn preflight_scales_linearly() {
+    // The quadratic version took 17 s for 5,000 paths in release; this has to
+    // finish in a fraction of that even in a debug build. The list goes in by
+    // file because 5,000 paths overflow the 32,767-character command line.
+    let dir = TempDir::new().unwrap();
+    let mut list = String::new();
+    for n in 0..5_000 {
+        let file = dir.path().join(format!("file-{n:05}.txt"));
+        fs::write(&file, "").unwrap();
+        list.push_str(&format!("{}\n", file.display()));
+    }
+    let list_path = dir.path().join("list.lst");
+    fs::write(&list_path, list).unwrap();
+
+    let started = std::time::Instant::now();
+    binit()
+        .args(["--dry-run", "--quiet", "--files-from"])
+        .arg(&list_path)
+        .assert()
+        .code(0);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "5,000 paths took {elapsed:?}"
+    );
+}

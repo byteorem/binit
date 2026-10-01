@@ -3,6 +3,8 @@
 // Opt in to `unsafe` for this file only; the crate root denies it.
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
+
 use windows_core::{ComObject, HSTRING, Result};
 
 use crate::bindings::{
@@ -25,6 +27,7 @@ pub fn recycle(items: &[PreparedPath]) -> Result<Vec<(usize, ItemOutcome)>> {
 
     let mut results: Vec<(usize, ItemOutcome)> = Vec::with_capacity(items.len());
     let mut pending: Vec<&PreparedPath> = items.iter().collect();
+    let by_index: HashMap<usize, &PreparedPath> = items.iter().map(|p| (p.index, p)).collect();
 
     // An error from PreDeleteItem cancels every operation queued behind it
     // (documented behaviour), so after a veto the untouched items are run
@@ -37,7 +40,7 @@ pub fn recycle(items: &[PreparedPath]) -> Result<Vec<(usize, ItemOutcome)>> {
         let mut retry: Vec<&PreparedPath> = Vec::new();
         for (index, outcome) in batch {
             if vetoed && outcome == ItemOutcome::NoResult {
-                if let Some(item) = pending.iter().find(|p| p.index == index) {
+                if let Some(item) = by_index.get(&index) {
                     retry.push(item);
                 }
             } else {

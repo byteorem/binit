@@ -14,12 +14,17 @@ mod recycle;
 mod report;
 mod sink;
 
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::io::Read;
 
-use clap::Parser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 
 use paths::{Prepared, PreparedPath};
-use report::{EXIT_FATAL, EmitOptions, ErrorCode, Failed, Recycled, Report, Skipped, Style};
+use report::{
+    EXIT_FATAL, EmitOptions, ErrorCode, Failed, Recycled, Report, SkipReason, Skipped, Style,
+};
 use sink::ItemOutcome;
 
 const HELP_TEMPLATE: &str = "\
@@ -37,9 +42,14 @@ EXAMPLES
   binit *.log
   binit --dry-run build\\
   binit --json old-data.csv
+  binit --files-from list.txt
 
 binit never deletes permanently. If an item cannot be moved to the
-Recycle Bin, binit refuses and exits non-zero. There is no --force.";
+Recycle Bin, binit refuses and exits non-zero. There is no --force.
+
+-f, -r, -R and --recursive are accepted so rm habits work. Only -f does
+anything: a path that does not exist is reported as skipped instead of
+failing. It forces nothing, and every other failure still fails.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,15 +58,22 @@ Recycle Bin, binit refuses and exits non-zero. There is no --force.";
     about = "binit — move files to the Windows Recycle Bin",
     help_template = HELP_TEMPLATE,
     after_help = AFTER_HELP,
-    override_usage = "binit <path|glob>...",
+    override_usage = "binit <path|glob>...\n  binit --files-from <file>",
     disable_help_subcommand = true,
     disable_help_flag = true,
     disable_version_flag = true
 )]
 struct Cli {
     // OsString so a non-UTF-8 name is a lookup failure, not a usage error.
-    #[arg(value_name = "path", required = true)]
+    // Not `required`: `--files-from` can supply them instead, and `run` reports
+    // a usage error when there are neither.
+    #[arg(value_name = "path")]
     paths: Vec<OsString>,
+
+    /// Read more paths from a file, one per line; `-` reads stdin. Lines are
+    /// literal paths: no glob expansion
+    #[arg(long = "files-from", value_name = "file")]
+    files_from: Option<OsString>,
 
     /// Print each item trashed
     #[arg(short = 'v', long)]
@@ -86,14 +103,20 @@ struct Cli {
     #[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
     version: Option<bool>,
 
-    // rm-compat no-ops, so `binit -rf build\` works from muscle memory.
-    // `-f` is free precisely because there is no --force.
-    #[arg(short = 'r', hide = true)]
+    // rm-compat flags, so `binit -rf build\` works from muscle memory.
+    // `-f` is not a force flag: there is none. Like `rm -f` it only stops a
+    // missing path from failing the run (it is reported as skipped), which
+    // keeps idempotent cleanup working. It changes nothing else.
+    #[arg(short = 'f', hide = true)]
+    ignore_missing: bool,
+    #[arg(short = 'r', long = "recursive", hide = true)]
     _compat_r: bool,
     #[arg(short = 'R', hide = true)]
     _compat_upper_r: bool,
-    #[arg(short = 'f', hide = true)]
-    _compat_f: bool,
+    // Declared only so `run` can refuse it with an explanation; clap's stock
+    // "unexpected argument" tip would suggest passing `--force` as a path.
+    #[arg(long, hide = true)]
+    force: bool,
     #[arg(short = 'i', hide = true)]
     _compat_i: bool,
     #[arg(short = 'd', hide = true)]
@@ -121,11 +144,32 @@ fn run() -> i32 {
         style,
     };
 
-    let inputs: Vec<String> = cli
+    if cli.force {
+        usage_error(
+            ErrorKind::UnknownArgument,
+            "binit has no --force: it never deletes permanently. To delete permanently, run Remove-Item yourself.",
+        );
+    }
+
+    let mut inputs: Vec<String> = cli
         .paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
+    if let Some(source) = &cli.files_from {
+        match read_files_from(source) {
+            Ok(lines) => inputs.extend(lines),
+            Err(e) => usage_error(
+                ErrorKind::Io,
+                &format!("cannot read --files-from {}: {e}", source.to_string_lossy()),
+            ),
+        }
+    } else if inputs.is_empty() {
+        usage_error(
+            ErrorKind::MissingRequiredArgument,
+            "no paths given; pass paths or --files-from <file>",
+        );
+    }
 
     let mut report = Report::new(cli.dry_run);
     let mut ready: Vec<PreparedPath> = Vec::new();
@@ -140,7 +184,16 @@ fn run() -> i32 {
             } => report.skipped.push(Skipped {
                 path: input,
                 reason,
-                container,
+                container: Some(container),
+            }),
+            Prepared::Fail {
+                input,
+                code: ErrorCode::NotFound,
+                ..
+            } if cli.ignore_missing => report.skipped.push(Skipped {
+                path: input,
+                reason: SkipReason::Missing,
+                container: None,
             }),
             Prepared::Fail {
                 input,
@@ -167,8 +220,10 @@ fn run() -> i32 {
     } else if !ready.is_empty() {
         match recycle::recycle(&ready) {
             Ok(results) => {
+                let by_index: HashMap<usize, &PreparedPath> =
+                    ready.iter().map(|p| (p.index, p)).collect();
                 for (index, outcome) in results {
-                    let Some(item) = ready.iter().find(|p| p.index == index) else {
+                    let Some(item) = by_index.get(&index) else {
                         continue;
                     };
                     record(&mut report, item, outcome);
@@ -183,6 +238,33 @@ fn run() -> i32 {
 
     report::emit(&report, &opts);
     report.exit_code()
+}
+
+/// Print a clap-style usage error and exit 2. Nothing is alive yet that a
+/// skipped destructor could matter to: this runs before any COM call.
+fn usage_error(kind: ErrorKind, message: &str) -> ! {
+    Cli::command().error(kind, message).exit()
+}
+
+/// Read a `--files-from` list: UTF-8, one literal path per line, blank lines
+/// ignored. `-` is stdin, read only when asked for so binit never blocks on a
+/// terminal by surprise.
+fn read_files_from(source: &OsStr) -> std::io::Result<Vec<String>> {
+    let text = if source == "-" {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        text
+    } else {
+        std::fs::read_to_string(source)?
+    };
+    // PowerShell 5 writes a BOM with `-Encoding UTF8`; it is not part of a path.
+    Ok(text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty())
+        .map(String::from)
+        .collect())
 }
 
 fn record(report: &mut Report, item: &PreparedPath, outcome: ItemOutcome) {

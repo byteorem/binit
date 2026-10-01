@@ -32,6 +32,7 @@ pub enum ErrorCode {
     AccessDenied,
     InUse,
     PathTooLong,
+    DriveRoot,
     EmptyPath,
     ShellError,
     NoResult,
@@ -48,6 +49,7 @@ impl ErrorCode {
             ErrorCode::AccessDenied => "ACCESS_DENIED",
             ErrorCode::InUse => "IN_USE",
             ErrorCode::PathTooLong => "PATH_TOO_LONG",
+            ErrorCode::DriveRoot => "DRIVE_ROOT",
             ErrorCode::EmptyPath => "EMPTY_PATH",
             ErrorCode::ShellError => "SHELL_ERROR",
             ErrorCode::NoResult => "NO_RESULT",
@@ -69,6 +71,8 @@ pub enum SkipReason {
     Duplicate,
     /// Lives inside a directory that is also being trashed.
     NestedIn,
+    /// Not found, and `-f` asked for that to be reported rather than fail.
+    Missing,
 }
 
 impl SkipReason {
@@ -76,6 +80,7 @@ impl SkipReason {
         match self {
             SkipReason::Duplicate => "duplicate",
             SkipReason::NestedIn => "nested_in",
+            SkipReason::Missing => "missing",
         }
     }
 }
@@ -84,6 +89,26 @@ impl SkipReason {
 fn win32(code: i32) -> HRESULT {
     WIN32_ERROR(code.cast_unsigned()).to_hresult()
 }
+
+/// The `COPYENGINE_E_*` HRESULTs (`sherrors.h`) that `IFileOperation` reports in
+/// place of the `0x8007xxxx` Win32 codes, with the category each belongs to.
+/// The `_SRC` and `_DEST` variants are the same failure seen from either side
+/// of a move; a delete mostly reports one of them, but both are mapped. Neither
+/// cancellation code has a category of its own, so both stay `ShellError` and
+/// keep the shell's own message.
+const COPY_ENGINE_ERRORS: &[(u32, ErrorCode)] = &[
+    (0x8027_0000, ErrorCode::ShellError),   // USER_CANCELLED
+    (0x8027_0001, ErrorCode::ShellError),   // CANCELLED
+    (0x8027_001D, ErrorCode::PathTooLong),  // PATH_TOO_DEEP_SRC
+    (0x8027_001E, ErrorCode::PathTooLong),  // PATH_TOO_DEEP_DEST
+    (0x8027_0021, ErrorCode::AccessDenied), // ACCESS_DENIED_SRC
+    (0x8027_0022, ErrorCode::AccessDenied), // ACCESS_DENIED_DEST
+    (0x8027_0023, ErrorCode::NotFound),     // PATH_NOT_FOUND_SRC
+    (0x8027_0024, ErrorCode::NotFound),     // PATH_NOT_FOUND_DEST
+    (0x8027_0027, ErrorCode::InUse),        // SHARING_VIOLATION_SRC
+    (0x8027_0028, ErrorCode::InUse),        // SHARING_VIOLATION_DEST
+    (0x8027_0038, ErrorCode::PathTooLong),  // RECYCLE_PATH_TOO_LONG
+];
 
 /// Map a shell HRESULT to an error code and a human message.
 pub fn classify(hr: i32) -> (ErrorCode, String) {
@@ -94,6 +119,11 @@ pub fn classify(hr: i32) -> (ErrorCode, String) {
         ErrorCode::InUse
     } else if hresult == win32(ERROR_FILE_NOT_FOUND) || hresult == win32(ERROR_PATH_NOT_FOUND) {
         ErrorCode::NotFound
+    } else if let Some((_, category)) = COPY_ENGINE_ERRORS
+        .iter()
+        .find(|(value, _)| *value == hr.cast_unsigned())
+    {
+        *category
     } else {
         ErrorCode::ShellError
     };
@@ -119,7 +149,8 @@ pub struct Recycled {
 pub struct Skipped {
     pub path: String,
     pub reason: SkipReason,
-    pub container: String,
+    /// The argument that covers this one; `None` when nothing does (`Missing`).
+    pub container: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,9 +324,11 @@ pub fn emit(report: &Report, opts: &EmitOptions) {
 }
 
 fn skip_explanation(s: &Skipped) -> String {
+    let container = s.container.as_deref().unwrap_or_default();
     match s.reason {
-        SkipReason::NestedIn => format!("already covered by {}", s.container),
-        SkipReason::Duplicate => format!("duplicate of {}", s.container),
+        SkipReason::NestedIn => format!("already covered by {container}"),
+        SkipReason::Duplicate => format!("duplicate of {container}"),
+        SkipReason::Missing => "no such file or directory".into(),
     }
 }
 
@@ -403,7 +436,7 @@ mod tests {
         r.skipped.push(Skipped {
             path: "C:\\dir\\b.txt".into(),
             reason: SkipReason::NestedIn,
-            container: "C:\\dir".into(),
+            container: Some("C:\\dir".into()),
         });
         r.failed.push(failed(ErrorCode::NotRecyclable));
 
@@ -464,9 +497,16 @@ mod tests {
         r.skipped.push(Skipped {
             path: "C:\\dir\\b.txt".into(),
             reason: SkipReason::NestedIn,
-            container: "C:\\dir".into(),
+            container: Some("C:\\dir".into()),
+        });
+        r.skipped.push(Skipped {
+            path: "gone.txt".into(),
+            reason: SkipReason::Missing,
+            container: None,
         });
         assert_eq!(r.exit_code(), EXIT_OK);
+        assert_eq!(r.to_json()["skipped"][1]["reason"], "missing");
+        assert!(r.to_json()["skipped"][1]["container"].is_null());
     }
 
     #[test]
@@ -504,6 +544,36 @@ mod tests {
             classify(0x8000_4005u32.cast_signed()).0,
             ErrorCode::ShellError
         );
+    }
+
+    #[test]
+    fn classify_maps_the_copy_engine_codes() {
+        // Values and names are from sherrors.h. The sharing violations were
+        // observed from a held-open file (SRC, 0x80270027) and from recycling
+        // the process's own working directory (DEST, 0x80270028).
+        let cases: &[(u32, ErrorCode)] = &[
+            (0x8027_0000, ErrorCode::ShellError),
+            (0x8027_0001, ErrorCode::ShellError),
+            (0x8027_001D, ErrorCode::PathTooLong),
+            (0x8027_001E, ErrorCode::PathTooLong),
+            (0x8027_0021, ErrorCode::AccessDenied),
+            (0x8027_0022, ErrorCode::AccessDenied),
+            (0x8027_0023, ErrorCode::NotFound),
+            (0x8027_0024, ErrorCode::NotFound),
+            (0x8027_0027, ErrorCode::InUse),
+            (0x8027_0028, ErrorCode::InUse),
+            (0x8027_0038, ErrorCode::PathTooLong),
+            // A copy-engine code with no category stays ShellError.
+            (0x8027_0035, ErrorCode::ShellError),
+        ];
+        for (hr, expected) in cases {
+            assert_eq!(
+                classify(hr.cast_signed()).0,
+                *expected,
+                "{}",
+                format_hresult(hr.cast_signed())
+            );
+        }
     }
 
     #[test]

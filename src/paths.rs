@@ -8,6 +8,7 @@
 // denies it.
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::report::{ErrorCode, SkipReason};
@@ -29,6 +30,9 @@ pub struct PreparedPath {
     /// so a subst drive reads back as `Y:\file.txt`.
     pub input: String,
     pub resolved: String,
+    /// Case-folded `resolved`: the identity used for dedup and nesting, so each
+    /// path is folded once rather than on every comparison.
+    pub key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -67,22 +71,30 @@ pub fn is_too_long(path: &str) -> bool {
     path.chars().count() > MAX_PATH_CHARS
 }
 
-/// Component-wise containment. A naive `starts_with` on strings wrongly nests
-/// `C:\foobar` under `C:\foo`.
-pub fn is_nested_in(child: &Path, parent: &Path) -> bool {
-    let child = components_lower(child);
-    let parent = components_lower(parent);
-    parent.len() < child.len() && child[..parent.len()] == parent[..]
+/// A drive root in any spelling: `C:`, `C:\`, `C:/`, `\\?\C:\`.
+fn is_drive_root(path: &str) -> bool {
+    let rest = path.strip_prefix("\\\\?\\").unwrap_or(path);
+    // `drive_letter` guarantees two ASCII bytes, so `rest[2..]` is a boundary.
+    drive_letter(Path::new(rest)).is_some() && rest[2..].chars().all(|c| c == '\\' || c == '/')
 }
 
-fn components_lower(path: &Path) -> Vec<String> {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
-        .collect()
+/// Strip trailing separators so `build` and `build\` are the same path, and so
+/// `symlink_metadata` does not follow a link written as `link\`. A drive root
+/// keeps its separator: `C:` alone means "the current directory on C:".
+fn trim_trailing_separators(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['\\', '/']);
+    if is_drive_root(trimmed) {
+        format!("{trimmed}\\")
+    } else if trimmed.is_empty() {
+        path.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
-/// Case-insensitive key for dedup. Windows paths are case-insensitive.
-fn dedup_key(path: &str) -> String {
+/// Case-insensitive key for dedup and nesting. Windows paths are
+/// case-insensitive.
+fn path_key(path: &str) -> String {
     path.to_lowercase()
 }
 
@@ -118,14 +130,25 @@ pub fn resolve_subst(path: &Path) -> Result<PathBuf, SubstError> {
 
         let text = current.to_string_lossy().into_owned();
         let remainder = text[2..].trim_start_matches(['\\', '/']);
-        let mut next = PathBuf::from(target.trim_end_matches('\\'));
-        if !remainder.is_empty() {
-            next.push(remainder);
-        }
-        current = next;
+        current = PathBuf::from(join_subst(&target, remainder));
     }
 
     Err(SubstError::Cycle)
+}
+
+/// Append the part of the path after the drive letter to a subst target.
+///
+/// Built as a string because `PathBuf::push` onto a bare `G:` (what trimming
+/// `G:\` leaves) yields the drive-relative `G:dev\x.txt`.
+fn join_subst(target: &str, remainder: &str) -> String {
+    let base = target.trim_end_matches('\\');
+    if !remainder.is_empty() {
+        format!("{base}\\{remainder}")
+    } else if is_drive_root(base) {
+        format!("{base}\\")
+    } else {
+        base.to_string()
+    }
 }
 
 /// Translate a `QueryDosDeviceW` answer into a usable path, or `None` when the
@@ -220,12 +243,22 @@ fn prepare_one(index: usize, input: &str) -> Prepared {
             );
         }
     };
-    let resolved_text = resolved.to_string_lossy().into_owned();
+    let resolved_text = trim_trailing_separators(&resolved.to_string_lossy());
 
     if is_unc(&resolved_text) || is_unc(input) {
         return fail(
             ErrorCode::UncNoRecycleBin,
             "network locations have no Recycle Bin",
+            Some(resolved_text),
+        );
+    }
+
+    // `input` is checked too: `C:` absolutizes to the current directory on C:,
+    // which would otherwise hide that the user typed a bare drive.
+    if is_drive_root(&resolved_text) || is_drive_root(input.trim()) {
+        return fail(
+            ErrorCode::DriveRoot,
+            "a drive root cannot be moved to the Recycle Bin",
             Some(resolved_text),
         );
     }
@@ -262,23 +295,24 @@ fn prepare_one(index: usize, input: &str) -> Prepared {
     Prepared::Ready(PreparedPath {
         index,
         input: input.to_string(),
+        key: path_key(&resolved_text),
         resolved: resolved_text,
     })
 }
 
 fn filter_duplicates(staged: &mut [Prepared]) {
-    let mut seen: Vec<(String, String)> = Vec::new();
+    // key -> input of the first argument with that path
+    let mut seen: HashMap<String, String> = HashMap::new();
     for entry in staged.iter_mut() {
         let Prepared::Ready(p) = entry else { continue };
-        let key = dedup_key(&p.resolved);
-        if let Some((_, first)) = seen.iter().find(|(k, _)| *k == key) {
+        if let Some(first) = seen.get(&p.key) {
             *entry = Prepared::Skip {
                 input: p.input.clone(),
                 reason: SkipReason::Duplicate,
                 container: first.clone(),
             };
         } else {
-            seen.push((key, p.input.clone()));
+            seen.insert(p.key.clone(), p.input.clone());
         }
     }
 }
@@ -286,21 +320,28 @@ fn filter_duplicates(staged: &mut [Prepared]) {
 /// Drop paths already covered by another argument. Recycling the container
 /// first would otherwise make the nested path report a spurious `NOT_FOUND`.
 /// The skip is reported, not silent.
+///
+/// Each path looks up its own ancestors, so the cost is paths x depth. Walking
+/// ancestors (rather than comparing strings) keeps the match component-wise:
+/// `C:\foobar` is not inside `C:\foo`.
 fn filter_nested(staged: &mut [Prepared]) {
-    let ready: Vec<(String, String)> = staged
+    // key -> (input position, input)
+    let ready: HashMap<String, (usize, String)> = staged
         .iter()
         .filter_map(|e| match e {
-            Prepared::Ready(p) => Some((p.resolved.clone(), p.input.clone())),
+            Prepared::Ready(p) => Some((p.key.clone(), (p.index, p.input.clone()))),
             _ => None,
         })
         .collect();
 
     for entry in staged.iter_mut() {
         let Prepared::Ready(p) = entry else { continue };
-        let child = PathBuf::from(&p.resolved);
-        let container = ready
-            .iter()
-            .find(|(resolved, _)| is_nested_in(&child, Path::new(resolved)));
+        // The earliest argument wins when several ancestors are also arguments.
+        let container = Path::new(&p.key)
+            .ancestors()
+            .skip(1)
+            .filter_map(|ancestor| ready.get(ancestor.to_str()?))
+            .min_by_key(|(position, _)| *position);
         if let Some((_, container_input)) = container {
             *entry = Prepared::Skip {
                 input: p.input.clone(),
@@ -314,32 +355,6 @@ fn filter_nested(staged: &mut [Prepared]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sibling_prefix_is_not_nested() {
-        assert!(!is_nested_in(Path::new("C:\\foobar"), Path::new("C:\\foo")));
-    }
-
-    #[test]
-    fn child_file_is_nested_in_its_directory() {
-        assert!(is_nested_in(
-            Path::new("C:\\dir\\file.txt"),
-            Path::new("C:\\dir")
-        ));
-    }
-
-    #[test]
-    fn nesting_is_case_insensitive() {
-        assert!(is_nested_in(
-            Path::new("C:\\Dir\\File.txt"),
-            Path::new("c:\\dir")
-        ));
-    }
-
-    #[test]
-    fn a_path_is_not_nested_in_itself() {
-        assert!(!is_nested_in(Path::new("C:\\dir"), Path::new("C:\\dir")));
-    }
 
     #[test]
     fn real_volumes_are_not_mappings() {
@@ -359,11 +374,6 @@ mod tests {
         let resolved = dos_target_to_path("\\??\\UNC\\srv\\share").unwrap();
         assert_eq!(resolved, "\\\\srv\\share");
         assert!(is_unc(&resolved));
-    }
-
-    #[test]
-    fn dedup_key_ignores_case() {
-        assert_eq!(dedup_key("C:\\A.TXT"), dedup_key("c:\\a.txt"));
     }
 
     #[test]
@@ -400,63 +410,125 @@ mod tests {
         }
     }
 
+    fn ready(index: usize, input: &str, resolved: &str) -> Prepared {
+        Prepared::Ready(PreparedPath {
+            index,
+            input: input.into(),
+            key: path_key(resolved),
+            resolved: resolved.into(),
+        })
+    }
+
+    /// `Some((reason, container))` for a skip, `None` for a still-ready entry.
+    fn skip_of(entry: &Prepared) -> Option<(SkipReason, &str)> {
+        match entry {
+            Prepared::Skip {
+                reason, container, ..
+            } => Some((*reason, container)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn duplicates_are_skipped_not_trashed_twice() {
         let mut staged = vec![
-            Prepared::Ready(PreparedPath {
-                index: 0,
-                input: "C:\\a.txt".into(),
-                resolved: "C:\\a.txt".into(),
-            }),
-            Prepared::Ready(PreparedPath {
-                index: 1,
-                input: "c:\\A.TXT".into(),
-                resolved: "c:\\A.TXT".into(),
-            }),
+            ready(0, "C:\\a.txt", "C:\\a.txt"),
+            ready(1, "c:\\A.TXT", "c:\\A.TXT"),
         ];
         filter_duplicates(&mut staged);
-        assert!(matches!(staged[0], Prepared::Ready(_)));
-        match &staged[1] {
-            Prepared::Skip {
-                reason, container, ..
-            } => {
-                assert_eq!(*reason, SkipReason::Duplicate);
-                assert_eq!(container, "C:\\a.txt");
-            }
-            other => panic!("expected a skip, got {other:?}"),
-        }
+        assert!(skip_of(&staged[0]).is_none());
+        assert_eq!(
+            skip_of(&staged[1]),
+            Some((SkipReason::Duplicate, "C:\\a.txt"))
+        );
+    }
+
+    #[test]
+    fn trailing_separator_does_not_defeat_dedup() {
+        let mut staged = vec![
+            ready(0, "build", &trim_trailing_separators("C:\\w\\build")),
+            ready(1, "build\\", &trim_trailing_separators("C:\\w\\build\\")),
+            ready(2, "build/", &trim_trailing_separators("C:\\w\\build/")),
+        ];
+        filter_duplicates(&mut staged);
+        assert!(skip_of(&staged[0]).is_none());
+        assert_eq!(skip_of(&staged[1]), Some((SkipReason::Duplicate, "build")));
+        assert_eq!(skip_of(&staged[2]), Some((SkipReason::Duplicate, "build")));
+    }
+
+    #[test]
+    fn trailing_separators_are_stripped_but_not_from_a_drive_root() {
+        assert_eq!(trim_trailing_separators("C:\\w\\build\\\\"), "C:\\w\\build");
+        assert_eq!(trim_trailing_separators("C:\\"), "C:\\");
+        assert_eq!(trim_trailing_separators("C:"), "C:\\");
+        assert_eq!(trim_trailing_separators("C:/"), "C:\\");
     }
 
     #[test]
     fn nested_paths_are_skipped_with_their_container() {
         let mut staged = vec![
-            Prepared::Ready(PreparedPath {
-                index: 0,
-                input: "dir".into(),
-                resolved: "C:\\dir".into(),
-            }),
-            Prepared::Ready(PreparedPath {
-                index: 1,
-                input: "dir\\file.txt".into(),
-                resolved: "C:\\dir\\file.txt".into(),
-            }),
-            Prepared::Ready(PreparedPath {
-                index: 2,
-                input: "dirwise".into(),
-                resolved: "C:\\dirwise".into(),
-            }),
+            ready(0, "dir", "C:\\dir"),
+            ready(1, "dir\\file.txt", "C:\\dir\\file.txt"),
+            ready(2, "dirwise", "C:\\dirwise"),
         ];
         filter_nested(&mut staged);
-        assert!(matches!(staged[0], Prepared::Ready(_)));
-        match &staged[1] {
-            Prepared::Skip {
-                reason, container, ..
-            } => {
-                assert_eq!(*reason, SkipReason::NestedIn);
-                assert_eq!(container, "dir");
-            }
-            other => panic!("expected a skip, got {other:?}"),
+        assert!(skip_of(&staged[0]).is_none());
+        assert_eq!(skip_of(&staged[1]), Some((SkipReason::NestedIn, "dir")));
+        // `C:\dirwise` shares a string prefix with `C:\dir`, not a component.
+        assert!(skip_of(&staged[2]).is_none());
+    }
+
+    #[test]
+    fn nesting_is_case_insensitive_and_a_path_is_not_nested_in_itself() {
+        let mut staged = vec![
+            ready(0, "c:\\dir", "c:\\dir"),
+            ready(1, "deep", "C:\\Dir\\A\\B\\File.txt"),
+        ];
+        filter_nested(&mut staged);
+        assert!(skip_of(&staged[0]).is_none());
+        assert_eq!(skip_of(&staged[1]), Some((SkipReason::NestedIn, "c:\\dir")));
+    }
+
+    #[test]
+    fn the_earliest_argument_is_named_as_container() {
+        let mut staged = vec![
+            ready(0, "inner", "C:\\a\\b"),
+            ready(1, "outer", "C:\\a"),
+            ready(2, "leaf", "C:\\a\\b\\c"),
+        ];
+        filter_nested(&mut staged);
+        assert_eq!(skip_of(&staged[0]), Some((SkipReason::NestedIn, "outer")));
+        assert!(skip_of(&staged[1]).is_none());
+        assert_eq!(skip_of(&staged[2]), Some((SkipReason::NestedIn, "inner")));
+    }
+
+    #[test]
+    fn drive_roots_are_recognised_in_every_spelling() {
+        for root in ["C:", "c:\\", "C:/", "C:\\\\", "\\\\?\\C:\\"] {
+            assert!(is_drive_root(root), "{root}");
         }
-        assert!(matches!(staged[2], Prepared::Ready(_)));
+        for not_root in ["C:\\dir", "C:dir", "\\\\srv\\share", "", "C", "dir"] {
+            assert!(!is_drive_root(not_root), "{not_root}");
+        }
+    }
+
+    #[test]
+    fn drive_roots_are_refused_in_preflight() {
+        for arg in ["C:\\", "C:", "C:/"] {
+            match prepare_one(0, arg) {
+                Prepared::Fail { code, .. } => assert_eq!(code, ErrorCode::DriveRoot, "{arg}"),
+                other => panic!("expected DRIVE_ROOT for {arg}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn subst_join_keeps_the_separator_after_a_root_target() {
+        // `Q:\dev\x.txt` with `subst Q: G:\` once became the drive-relative
+        // `G:dev\x.txt`.
+        assert_eq!(join_subst("G:\\", "dev\\x.txt"), "G:\\dev\\x.txt");
+        assert_eq!(join_subst("G:\\", ""), "G:\\");
+        assert_eq!(join_subst("C:\\some\\dir", "f.txt"), "C:\\some\\dir\\f.txt");
+        assert_eq!(join_subst("C:\\some\\dir\\", ""), "C:\\some\\dir");
     }
 }
