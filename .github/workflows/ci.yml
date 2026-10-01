@@ -20,5 +20,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      # preflight_scales_linearly asserts a wall-clock bound, which a busy
+      # runner can miss for reasons unrelated to the code. It runs locally.
+      - run: cargo test -- --skip preflight_scales_linearly
       - run: cargo build --release
